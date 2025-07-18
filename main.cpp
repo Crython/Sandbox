@@ -1,5 +1,6 @@
 ﻿// Sandbox Simulation - A simple particle simulation using SFML
 #include "main.h"
+#include <cassert>
 
 
 // Define the simulation grid size
@@ -11,12 +12,21 @@ constexpr int FRAME_RATE = 1000; // Max frame rate in FPS
 constexpr int TICK_RATE = 30; // Max simulation update rate in Hz
 constexpr double TICK_TIME = 1.0 / TICK_RATE; // seconds per tick
 
+constexpr int TEMP_MAX = 3000; // Maximum temperature for particles
+constexpr int TEMP_MIN = -273; // Absolute zero, minimum temperature for particles
+
 
 // Define the types of particles (<= 16)
 enum class CellType : uint8_t {
-    EMPTY, SAND, WATER, STONE, FIRE, OIL, WOOD, STEAM, SMOKE, ELECTRICITY, GLASS, LAVA /* 12 */
+    EMPTY, SAND, WATER, STONE, FIRE, OIL, WOOD, STEAM, SMOKE, ELECTRICITY, GLASS, LAVA, COLD /* 12 */
     // Add up to 16 total
 };
+
+enum class InputMode {
+    Brush, Debug, Size
+    // Add more as needed
+};
+
 
 // Cell data structure
 struct Cell {
@@ -43,6 +53,8 @@ public:
     bool PauseSim = false; // Pause simulation flag
 	bool debugMode = false; // Debug mode flag (for temperature, lifetime, etc.)
 
+    InputMode currentMode = InputMode::Brush;
+	int modeIndex = 0; // Index for current mode (for hotkeys, etc.)
    
 
 private:
@@ -67,7 +79,7 @@ private:
 	int brushSize = 1; // Default brush size
 
     // Particle logic
-    void UpdateWithChecker(bool mode);
+    void UpdateWithChecker(int mode);
     void updateCell(int x, int y);
       void updateSand(int x, int y);
       void updateWater(int x, int y);
@@ -80,6 +92,7 @@ private:
 	  void updateStone(int x, int y);
       void updateWood(int x, int y);
 	  void updateLava(int x, int y);
+      void updateCold(int x, int y);
 
 
     // Utility
@@ -87,7 +100,7 @@ private:
     void swapCells(int x1, int y1, int x2, int y2);
     bool canMoveTo(int x, int y, const Cell& from);
     Cell createCell(CellType type, float density, int temp, bool canFall, bool ParentCell);
-    std::vector<std::array<int, 2>> getCirclePoints(int x, int y, int radius);
+    std::vector<std::array<int, 2>> getCirclePoints(int cx, int cy, int radius);
     Cell read(int x, int y);
 	void write(int x, int y, const Cell& cell);
     void clearCells(int x, int y, int temp);
@@ -101,15 +114,18 @@ private:
 
     // Misc
     sf::Color getColor(CellType type);
+    sf::Color lerpColor(sf::Color a, sf::Color b, float t);
     std::string cellTypeToString(CellType type);
         Cell ClearCell = { CellType::EMPTY, 0.0f, 0, 0, false, 0, 0 }; // Default empty cell
 
     // Debug
-    sf::Color getTemperatureColor(int temp);
+    sf::Color getDebugColor(const Cell& cell);
+        sf::Color getTemperatureColor(int temp);
+        sf::Color getLifetimeColor(int lifetime);
 
 
 // Cell properties in an array for easy access and memory density
-const Cell cellProperties[12] = {
+const Cell cellProperties[13] = {
     //   type, density, temperature, lifetime, canFall, lastUpdate
     {               ClearCell               },
     { CellType::SAND, 1.6f, 20, 0, true, 0 },
@@ -122,7 +138,8 @@ const Cell cellProperties[12] = {
     { CellType::SMOKE, 0.0029f, 100, 0, true, 0 },
     { CellType::ELECTRICITY, 0.0f, 3000, 0, false, 0 },
     { CellType::GLASS, 2.6f, 1700, 0, false, 0 },
-    { CellType::LAVA, 2.7f, 1200, 0, true, 0 }
+    { CellType::LAVA, 2.7f, 1200, 0, true, 0 },
+	{ CellType::COLD, 0.0f, -273, 0, false, 0 } // Cold cell for extreme low temperatures
 };
 std::unordered_map<CellType, int> PropertyIndexMap = {
     { CellType::EMPTY, 0 },
@@ -136,7 +153,8 @@ std::unordered_map<CellType, int> PropertyIndexMap = {
     { CellType::SMOKE, 8 },
     { CellType::ELECTRICITY, 9 },
     { CellType::GLASS, 10 },
-    { CellType::LAVA, 11 }
+    { CellType::LAVA, 11 },
+	{ CellType::COLD, 12 } // Cold cell for extreme low temperatures
 };
 // Use like this:
 // cellProperties[PropertyIndexMap[CellType::TYPE]].value
@@ -321,12 +339,14 @@ void Simulation::rise(int x, int y) {
 }
 
 void Simulation::radiateHeat(int x, int y) {
-    Cell& cell = read(x, y);
+    const int spreadStrength = 8;
+
+    Cell cell = read(x, y); // from current grid
     int selfTemp = cell.temperature;
 
-    // For storing net temperature change
-    int delta = 0;
+    int totalDelta = 0;
 
+    // Loop through 8 neighbors
     for (int dx = -1; dx <= 1; ++dx) {
         for (int dy = -1; dy <= 1; ++dy) {
             if (dx == 0 && dy == 0) continue;
@@ -336,48 +356,57 @@ void Simulation::radiateHeat(int x, int y) {
 
             if (!inBounds(nx, ny)) continue;
 
-            Cell& neighbor = read(nx, ny);
+            Cell neighbor = read(nx, ny);
             int neighborTemp = neighbor.temperature;
 
-            // Simple diffusion model:
-            int diff = (selfTemp - neighborTemp) / 8; // flow strength
-            if (diff > 0) {
-                delta -= diff;
-                neighbor.temperature += diff;
-                (*nextGrid)[ny][nx] = neighbor;
+            // Calculate flow (positive = we give, negative = we receive)
+            int flow = (selfTemp - neighborTemp) / spreadStrength;
+
+            if (flow != 0) {
+                totalDelta -= flow;
+
+                // Apply to neighbor in nextGrid
+                Cell& targetNeighbor = (*nextGrid)[ny][nx];
+                targetNeighbor = neighbor;
+                targetNeighbor.temperature += flow;
             }
-			else {
-				delta += -diff; // if neighbor is hotter, we gain heat
-			}
         }
     }
 
-    cell.temperature = std::max(0, cell.temperature - 1);
-    cell.temperature += delta;
-    
-    (*nextGrid)[y][x] = cell;
+    // Apply net heat change to this cell
+    Cell& updated = (*nextGrid)[y][x];
+    updated = cell;
+
+    // Apply radiative loss
+    int decay = selfTemp / 100;
+    updated.temperature = updated.temperature + totalDelta - decay;
+
+    // Clamp to safe range
+    updated.temperature = std::clamp(updated.temperature, -273, TEMP_MAX);
 }
-
-
 
 Cell Simulation::createCell(CellType type, float density, int temp, bool canFall, bool ParentCell) {
     // Create a cell with specified properties (type, density, temperature, lifetime, can Fall?, lastUpdate, Is Parent?)
     return Cell{ type, density, temp, 0, canFall, 0, ParentCell };
 }
 
-std::vector<std::array<int, 2>> Simulation::getCirclePoints(int x, int y, int radius) {
-    std::vector<std::array<int, 2>> affectedCells;
-
+std::vector<std::array<int, 2>> Simulation::getCirclePoints(int cx, int cy, int radius) {
+    std::vector<std::array<int, 2>> result;
     int rSquared = radius * radius;
 
-    for (int dx = -radius; dx <= radius; ++dx) {
-        for (int dy = -radius; dy <= radius; ++dy) {
-            if (dx * dx + dy * dy <= rSquared) {
-                affectedCells.push_back({ dx + x, dy + y });
-            }
+    for (int dy = -radius; dy <= radius; ++dy) {
+        int y = cy + dy;
+
+        // Avoid sqrt for dy^2 > r^2
+        int dxLimit = static_cast<int>(std::sqrt(std::max(0, rSquared - dy * dy)));
+
+        for (int dx = -dxLimit; dx <= dxLimit; ++dx) {
+            int x = cx + dx;
+            result.push_back({ x, y });
         }
     }
-    return affectedCells;
+
+    return result;
 }
 
 std::string Simulation::cellTypeToString(CellType type) {
@@ -406,76 +435,157 @@ void Simulation::handleInput(const sf::RenderWindow& window) {
         for (std::array<int, 2> affec : getCirclePoints(x, y, brushSize)) {
 
             if (inBounds(affec[0], affec[1])) {
+                // Write the cell to the current and the next grid
                 write(affec[0], affec[1], createCell(currentBrush,
                     cellProperties[PropertyIndexMap[currentBrush]].density,
                     cellProperties[PropertyIndexMap[currentBrush]].temperature,
                     cellProperties[PropertyIndexMap[currentBrush]].canFall, 1));
 
 				(*currentGrid)[affec[1]][affec[0]] = (*nextGrid)[affec[1]][affec[0]]; // Copy to next grid
-
             }
         }
-
     }
-    // Change brush type with number keys
-    if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num1)) currentBrush = CellType::SAND;         // 1
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num2)) currentBrush = CellType::WATER;        // 2
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num3)) currentBrush = CellType::FIRE;         // 3
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num4)) currentBrush = CellType::STONE;        // 4
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num5)) currentBrush = CellType::WOOD;         // 5
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num6)) currentBrush = CellType::STEAM;        // 6
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num7)) currentBrush = CellType::SMOKE;        // 7
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num8)) currentBrush = CellType::ELECTRICITY;  // 8
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::Num9)) currentBrush = CellType::EMPTY;        // 9
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::S)) brushSize = 1;                            // S
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::M)) brushSize = 2;                            // M
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::L)) brushSize = 3;                            // L
-	if (sf::Keyboard::isKeyPressed(sf::Keyboard::X)) brushSize = 4;                            // XL
+
+
+    // Mode switching
+    static bool keyHandled[256] = {}; // Simple key debounce
+
+    auto pressOnce = [&](sf::Keyboard::Key key) {
+        if (sf::Keyboard::isKeyPressed(key)) {
+            if (!keyHandled[key]) {
+                keyHandled[key] = true;
+                return true;
+            }
+        }
+        else {
+            keyHandled[key] = false;
+        }
+        return false;
+    };
+
+    // Mode hotkeys
+    if (pressOnce(sf::Keyboard::D)) currentMode = InputMode::Debug;
+    if (pressOnce(sf::Keyboard::B)) currentMode = InputMode::Brush;
+    if (pressOnce(sf::Keyboard::S)) currentMode = InputMode::Size;
     
-    
-    static bool pWasPressedLastFrame = false;
-    bool pIsPressed = sf::Keyboard::isKeyPressed(sf::Keyboard::P);
-    // Only toggle if the key is *just* pressed
-    if (pIsPressed && !pWasPressedLastFrame) {
-        PauseSim = !PauseSim;
-    }
-    pWasPressedLastFrame = pIsPressed;
 
+    switch (currentMode) {
+    case InputMode::Debug: // Debug mode
+        if (pressOnce(sf::Keyboard::Num1)) {
+            std::cout << "Debug: Temperature View\n";
+			modeIndex = 1; // Set mode index for temperature view
+        }
+        if (pressOnce(sf::Keyboard::Num2)) {
+            std::cout << "Debug: Lifetime View\n";
+			modeIndex = 2; // Set mode index for lifetime view
+        }
 
-    static bool dWasPressedLastFrame = false;
-    bool dIsPressed = sf::Keyboard::isKeyPressed(sf::Keyboard::D);
-    // Only toggle if the key is *just* pressed
-    if (dIsPressed && !dWasPressedLastFrame) {
-        debugMode = !debugMode;
+		if (pressOnce(sf::Keyboard::Num0)) {
+			std::cout << "Debug: Default View\n";
+			modeIndex = 0; // Set mode index for default view
+		}
+        break;
+
+    case InputMode::Brush: // Brush drawing elements mode
+        if (pressOnce(sf::Keyboard::Num1)) {
+			currentBrush = CellType::SAND;
+        }
+		if (pressOnce(sf::Keyboard::Num2)) {
+			currentBrush = CellType::WATER; // Set brush to water
+		}
+		if (pressOnce(sf::Keyboard::Num3)) {
+			currentBrush = CellType::STONE; // Set brush to stone
+		}
+		if (pressOnce(sf::Keyboard::Num4)) {
+			currentBrush = CellType::FIRE; // Set brush to fire
+		}
+		if (pressOnce(sf::Keyboard::Num5)) {
+			currentBrush = CellType::OIL; // Set brush to oil
+		}
+		if (pressOnce(sf::Keyboard::Num6)) {
+			currentBrush = CellType::WOOD; // Set brush to wood
+		}
+		if (pressOnce(sf::Keyboard::Num7)) {
+			currentBrush = CellType::STEAM; // Set brush to steam
+		}
+		if (pressOnce(sf::Keyboard::Num8)) {
+			currentBrush = CellType::COLD; // Set brush to smoke
+		}
+		if (pressOnce(sf::Keyboard::Num9)) {
+			currentBrush = CellType::ELECTRICITY; // Set brush to electricity
+		}
+        if (pressOnce(sf::Keyboard::Num0)) {
+            currentBrush = CellType::EMPTY; // Set brush to empty
+        }
+        break;
+
+	case InputMode::Size: // Size changing mode
+        
+        if (pressOnce(sf::Keyboard::Add) || pressOnce(sf::Keyboard::Equal)) {
+            // Increase brush size
+			std::cerr << "Increased brush size\n";
+			brushSize++;
+        }
+        if (pressOnce(sf::Keyboard::Subtract) || pressOnce(sf::Keyboard::Hyphen)) {
+            // Decrease brush size
+			std::cerr << "Decreased brush size\n";
+			if (brushSize > 1) brushSize--; // Prevent negative size
+        }
+        break;
+
     }
-    dWasPressedLastFrame = dIsPressed;
+    // Add more modes as needed
+
 
 }
 
-void Simulation::UpdateWithChecker(bool mode) {
+void Simulation::UpdateWithChecker(int mode) {
 
-    if (mode) {
+    if (mode == 0) {
         // Update the next grid based on the current grid
         for (int y = HEIGHT - 1; y >= 0; --y) {
             for (int x = 0; x < WIDTH; ++x) {
-                if (x % 2 == mode) {
+                if (x % 2 == 1) {
                     radiateHeat(x, y); // Radiate heat
                     updateCell(x, y);
                 }
             }
         }
 	}
-	else {
-		// Update the next grid based on the current grid
+    else if (mode == 1) {
+        // Update the next grid based on the current grid
         for (int y = HEIGHT - 1; y >= 0; --y) {
+            for (int x = 0; x < WIDTH; ++x) {
+                if (x % 2 == 0) {
+                    radiateHeat(x, y); // Radiate heat
+                    updateCell(x, y);
+                }
+            }
+        }
+    }
+	else if (mode == 2) {
+		// Update the next grid based on the current grid
+		for (int y = HEIGHT - 1; y >= 0; --y) {
 			for (int x = WIDTH - 1; x >= 0; --x) {
-				if (x % 2 == mode) {
+				if (x % 2 == 1) {
 					radiateHeat(x, y); // Radiate heat
 					updateCell(x, y);
 				}
 			}
 		}
 	}
+	else if (mode  == 3) {
+		// Update the next grid based on the current grid
+        for (int y = HEIGHT - 1; y >= 0; --y) {
+			for (int x = WIDTH - 1; x >= 0; --x) {
+				if (x % 2 == 0) {
+					radiateHeat(x, y); // Radiate heat
+					updateCell(x, y);
+				}
+			}
+		}
+	}
+    assert(mode < 4);
     
 }
 
@@ -484,21 +594,23 @@ void Simulation::update() {
     // Update the grid with a checker pattern
     if (alternateFrame) {
         // Update with checker pattern
-		UpdateWithChecker(true); 
-		UpdateWithChecker(false);
+		UpdateWithChecker(0); 
+		UpdateWithChecker(1);
 
 		alternateFrame = false; // Toggle for next frame
 	}
 	else {
 		// Update without checker pattern
-        UpdateWithChecker(false);
-		UpdateWithChecker(true);
+        UpdateWithChecker(2);
+		UpdateWithChecker(3);
 
         alternateFrame = true; // Toggle for next frame
 	}
 
-
 	std::swap(currentGrid, nextGrid); // Swap the grids to apply updates
+
+
+
 }
 
 void Simulation::updateCell(int x, int y) {
@@ -514,6 +626,8 @@ void Simulation::updateCell(int x, int y) {
     case CellType::SMOKE: updateSmoke(x, y); break;
     case CellType::ELECTRICITY: updateElectricity(x, y); break;
     case CellType::GLASS: updateGlass(x, y); break;
+	case CellType::LAVA: updateLava(x, y); break;
+    case CellType::COLD: updateCold(x, y); break;
 
     default: std::cerr << "In function updateCell - Type " << cellTypeToString(grid[y][x].type) << " not included!\n"; break;
     }
@@ -766,39 +880,108 @@ void Simulation::updateLava(int x, int y) {
     flow(x, y);
 
     cell.lifetime++;
-};
+}
+
+void Simulation::updateCold(int x, int y) {
+
+    Cell& cell = read(x, y);
+
+	clearCells(x, y, cell.temperature); // Clear the cell but retain temperature
+	// Cold cells do not move or interact, just make thing really cold for some time
+
+}
+
+sf::Color Simulation::getDebugColor(const Cell& cell) {
+
+    if (modeIndex == 1) {
+        return getTemperatureColor(cell.temperature);
+    }
+	if (modeIndex == 2) {
+        return getLifetimeColor(cell.lifetime);
+	}
+
+	if (modeIndex == 0) {
+		// Default view, return color based on cell type
+		return getColor(cell.type);
+	}
+
+	// Fallback color if no mode matches
+	return sf::Color::Magenta; // Magenta color
+}
+
+sf::Color Simulation::lerpColor(sf::Color a, sf::Color b, float t) {
+    return sf::Color(
+        static_cast<sf::Uint8>(a.r + (b.r - a.r) * t),
+        static_cast<sf::Uint8>(a.g + (b.g - a.g) * t),
+        static_cast<sf::Uint8>(a.b + (b.b - a.b) * t),
+        static_cast<sf::Uint8>(a.a + (b.a - a.a) * t)
+    );
+}
+
+sf::Color Simulation::getLifetimeColor(int lifetime) {
+	
+    return sf::Color(30, 30, 30, 255);
+}
 
 sf::Color Simulation::getTemperatureColor(int temp) {
-    if (temp <= 1)
-        return sf::Color(0, 0, 0, 0); // Fully transparent black
 
-    else if (temp == 100)
-        return sf::Color(50, 150, 50, 200); // Green threshold, semi-transparent
+    // Handle out of bounds temperatures
+    if (temp <= -273) return sf::Color(255, 255, 255, 30);  // White, very transparent
 
-    else if (temp < 100) {
-        // 1 to 99 → Blue → Red, opacity grows linearly
-        float t = temp / 100.f;
-        sf::Uint8 r = static_cast<sf::Uint8>(255 * t);
-        sf::Uint8 g = 0;
-        sf::Uint8 b = static_cast<sf::Uint8>(255 * (1.1f + t));
-        sf::Uint8 a = static_cast<sf::Uint8>(100 + 155 * t); // Opacity: 100 → 255
-        return sf::Color(r, g, b, a);
+    // Handle extreme low temperatures
+    if (temp < -100) {
+        float t = (temp + 273.0f) / 173.0f;
+        return lerpColor(sf::Color(255, 255, 255, 30), sf::Color(45, 90, 170, 60), t);
+    }
+    // Handle temperatures below 0°C
+    if (temp < 0) {
+        float t = (temp + 100.0f) / 100.0f;
+        return lerpColor(sf::Color(45, 90, 170, 60), sf::Color(0, 0, 0, 100), t);
+    }
+    // Handle temperatures from 0°C to 30°C
+    if (temp <= 30) {
+        float t = temp / 30.0f;
+        return lerpColor(sf::Color(0, 0, 0, 80), sf::Color(40, 40, 255, 110), t);
+    }
+    // Handle temperatures from 30°C to 60°C
+    if (temp <= 60) {
+        float t = (temp - 30) / 30.0f;
+        return lerpColor(sf::Color(40, 40, 255, 110), sf::Color(255, 150, 0, 160), t);
+    }
+    // Handle temperatures from 60°C to 100°C
+    if (temp <= 100) {
+        float t = (temp - 60) / 50.0f; // starts from 60°C to 110°C
+        return lerpColor(sf::Color(255, 150, 0, 160), sf::Color(255, 50, 0, 200), t);
+    }
+    // 100 to 500: goes from red to orange
+    if (temp <= 500) {
+        float t = (temp - 100) / 400.0f;
+        return lerpColor(sf::Color(255, 0, 0, 180), sf::Color(255, 160, 0, 230), t);
+    }
+    // 100 to 500, but reversers the order to go from orange to red
+    if (temp <= 1000) {
+        float t = (temp - 500) / 500.0f;
+        return lerpColor(sf::Color(255, 160, 0, 230), sf::Color(255, 0, 0, 255), t);
+    }
+    // Handle 1000 to TEMP_MAX with a 3-point gradient
+    if (temp <= TEMP_MAX) {
+        float t = (temp - 1000) / float(TEMP_MAX - 1000);
+
+        if (t < 0.5f) {
+            // 1000 → midpoint (e.g., 2000): red → orange
+            float localT = t / 0.5f;
+            return lerpColor(sf::Color(255, 0, 0, 255), sf::Color(255, 100, 0, 255), localT);
+        }
+        else {
+            // midpoint → TEMP_MAX: orange → white
+            float localT = (t - 0.5f) / 0.5f;
+            return lerpColor(sf::Color(255, 100, 0, 255), sf::Color(255, 255, 255, 255), localT);
+        }
     }
 
-    else if (temp <= 3000) {
-        // 101 to 3000 → Green → Yellow → White, opacity also increases
-        float t = (temp - 100.f) / 2900.f; // Normalize to [0, 1]
-        sf::Uint8 r = 50 + static_cast<sf::Uint8>(205 * t);   // 50 → 255
-        sf::Uint8 g = 150 + static_cast<sf::Uint8>(105 * t);  // 150 → 255
-        sf::Uint8 b = static_cast<sf::Uint8>(50 * (1.f - t)); // 50 → 0
-        sf::Uint8 a = static_cast<sf::Uint8>(150 + 105 * t);  // 150 → 255
-        return sf::Color(r, g, b, a);
-    }
 
-    else {
-        // > 3000: white and fully opaque
-        return sf::Color(255, 255, 255, 255);
-    }
+    // Beyond TEMP_MAX, return white
+    return sf::Color(255, 255, 255);
 }
 
 
@@ -814,12 +997,14 @@ void Simulation::draw(sf::RenderWindow& window) {
             float py = y * PIXEL_SIZE;
             
 
-			// blue-to-red shading based on temperature
-            sf::Color color = debugMode ? getTemperatureColor(cell.temperature) : getColor(cell.type);
+            sf::Color color;
 
-			// blue-green-red shading based on lifetime
-            //sf::Color color = debugMode ? sf::Color( std::clamp(cell.lifetime * 10 - 510, 0, 255),  std::clamp(cell.lifetime * 10 - 255, 0, 255), std::clamp(cell.lifetime * 10, 20, 255) ) : getColor(cell.type);
-            
+            if (currentMode == InputMode::Debug) {
+                color = getDebugColor(cell);
+            }
+            else {
+                color = getColor(cell.type);
+            }
 
 			// Add the cell as a quad
             cells.append(sf::Vertex(sf::Vector2f(px, py), color));
@@ -834,17 +1019,19 @@ void Simulation::draw(sf::RenderWindow& window) {
 
 sf::Color Simulation::getColor(CellType type) {
     switch (type) {
-    case CellType::EMPTY: return sf::Color(30, 30, 30);
-    case CellType::SAND: return sf::Color(194, 178, 128);
-    case CellType::WATER: return sf::Color(50, 100, 255);
-    case CellType::STONE: return sf::Color(100, 100, 100);
-    case CellType::FIRE: return sf::Color(255, 80, 20);
-    case CellType::WOOD: return sf::Color(85, 45, 15);
-    case CellType::OIL: return sf::Color(50, 40, 40);
-    case CellType::STEAM: return sf::Color(190, 180, 180);
-    case CellType::SMOKE: return sf::Color(50, 45, 45);
-    case CellType::ELECTRICITY: return sf::Color(0, 230, 250);
-    case CellType::GLASS: return sf::Color(185, 225, 230);
+    case CellType::EMPTY: return sf::Color(30, 30, 30, 255);
+    case CellType::SAND: return sf::Color(194, 178, 128, 255);
+    case CellType::WATER: return sf::Color(50, 100, 255, 255);
+    case CellType::STONE: return sf::Color(100, 100, 100, 255);
+    case CellType::FIRE: return sf::Color(255, 80, 20, 255);
+    case CellType::WOOD: return sf::Color(85, 45, 15, 255);
+    case CellType::OIL: return sf::Color(50, 40, 40, 255);
+    case CellType::STEAM: return sf::Color(190, 180, 180, 255);
+    case CellType::SMOKE: return sf::Color(50, 45, 45, 255);
+    case CellType::ELECTRICITY: return sf::Color(0, 230, 250, 255);
+    case CellType::GLASS: return sf::Color(185, 225, 230, 255);
+	case CellType::LAVA: return sf::Color(255, 100, 0, 255);
+	case CellType::COLD: return sf::Color(207, 207, 247, 150); // Cold cells
     default: std::cerr << "getColor: Type not included!\n"; return sf::Color::Magenta;
     }
 }
@@ -865,10 +1052,11 @@ int main() {
 	std::ofstream File("log.txt");
     
     int i = 0;
+	float lastFPS = TICK_RATE;
 
 	// Main loop
     while (window->isOpen()) {
-        
+
         auto current = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = current - previous;
         previous = current;
@@ -894,10 +1082,10 @@ int main() {
             }
             else {
                 sim->swapGrids(); // Swap grids after each tick
-				break; // Exit the loop if paused
+                break; // Exit the loop if paused
             }
         }
-        
+
 
         // Always render — even when paused
         window->clear();
@@ -906,8 +1094,16 @@ int main() {
 
         // Optional FPS logging
         auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - current).count();
-        std::cout << "FPS: " << 1000000.f / duration << '\n';
+
+        // Calculate and display FPS every 10 frames
+        if (i % static_cast<int>(lastFPS) == 0) {
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - current).count();
+			lastFPS = 1000000.f / duration;
+            std::cout << "FPS: " << lastFPS << '\n';
+			i = 0; // Reset frame counter
+        }
+        
+        i++;
     }
 
 
