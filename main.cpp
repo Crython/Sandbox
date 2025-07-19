@@ -1,6 +1,5 @@
 ﻿// Sandbox Simulation - A simple particle simulation using SFML
 #include "main.h"
-#include <cassert>
 
 
 // Define the simulation grid size
@@ -34,10 +33,10 @@ struct Cell {
     float density = 0.0f; // Basic density
     int temperature = 0; // For advanced stuff
     int lifetime = 0; // For fire, smoke, etc.
-	bool canFall = false; // Does gravity affect this particle?
-	int lastUpdate = 0; // For performance optimazations
-	bool ParentCell = false; // Is this cell a parent cell? (for fire, etc.)
-	// Additional properties can be added here
+    bool canFall = false; // Does gravity affect this particle?
+    int lastUpdate = 0; // For performance optimazations
+    bool ParentCell = false; // Is this cell a parent cell? (for fire, etc.)
+    // Additional properties can be added here
 };
 
 // Simulation class
@@ -48,13 +47,13 @@ public:
     void handleInput(const sf::RenderWindow& window);
     void update();
     void draw(sf::RenderWindow& window);
-	void swapGrids() { std::swap(currentGrid, nextGrid); } // Swap current and next grids
+    void swapGrids() { std::swap(currentGrid, nextGrid); } // Swap current and next grids
 
     bool PauseSim = false; // Pause simulation flag
-	bool debugMode = false; // Debug mode flag (for temperature, lifetime, etc.)
+    bool debugMode = false; // Debug mode flag (for temperature, lifetime, etc.)
 
     InputMode currentMode = InputMode::Brush;
-	int modeIndex = 0; // Index for current mode (for hotkeys, etc.)
+    int modeIndex = 0; // Index for current mode (for hotkeys, etc.)
    
 
 private:
@@ -76,7 +75,7 @@ private:
     //          +
 
     CellType currentBrush = CellType::SAND; // Default brush type
-	int brushSize = 1; // Default brush size
+    int brushSize = 1; // Default brush size
 
     // Particle logic
     void UpdateWithChecker(int mode);
@@ -89,9 +88,9 @@ private:
       void updateSmoke(int x, int y);
       void updateElectricity(int x, int y);
       void updateGlass(int x, int y);
-	  void updateStone(int x, int y);
+      void updateStone(int x, int y);
       void updateWood(int x, int y);
-	  void updateLava(int x, int y);
+      void updateLava(int x, int y);
       void updateCold(int x, int y);
 
 
@@ -102,7 +101,7 @@ private:
     Cell createCell(CellType type, float density, int temp, bool canFall, bool ParentCell);
     std::vector<std::array<int, 2>> getCirclePoints(int cx, int cy, int radius);
     Cell read(int x, int y);
-	void write(int x, int y, const Cell& cell);
+    void write(int x, int y, const Cell& cell);
     void clearCells(int x, int y, int temp);
 
 
@@ -139,7 +138,7 @@ const Cell cellProperties[13] = {
     { CellType::ELECTRICITY, 0.0f, 3000, 0, false, 0 },
     { CellType::GLASS, 2.6f, 1700, 0, false, 0 },
     { CellType::LAVA, 2.7f, 1200, 0, true, 0 },
-	{ CellType::COLD, 0.0f, -273, 0, false, 0 } // Cold cell for extreme low temperatures
+    { CellType::COLD, 0.0f, -273, 0, false, 0 } // Cold cell for extreme low temperatures
 };
 std::unordered_map<CellType, int> PropertyIndexMap = {
     { CellType::EMPTY, 0 },
@@ -615,18 +614,18 @@ void Simulation::update() {
 
 void Simulation::updateCell(int x, int y) {
     switch (read(x, y).type) {
-	case CellType::EMPTY: break; // Do nothing for empty cells
+    case CellType::EMPTY: break; // Do nothing for empty cells
     case CellType::SAND: updateSand(x, y); break;
     case CellType::WATER: updateWater(x, y); break;
     case CellType::STONE: updateStone(x, y); break;
-	case CellType::WOOD: updateWood(x, y); break;
+    case CellType::WOOD: updateWood(x, y); break;
     case CellType::FIRE: updateFire(x, y); break;
     case CellType::OIL: updateOil(x, y); break;
     case CellType::STEAM: updateSteam(x, y); break;
     case CellType::SMOKE: updateSmoke(x, y); break;
     case CellType::ELECTRICITY: updateElectricity(x, y); break;
     case CellType::GLASS: updateGlass(x, y); break;
-	case CellType::LAVA: updateLava(x, y); break;
+    case CellType::LAVA: updateLava(x, y); break;
     case CellType::COLD: updateCold(x, y); break;
 
     default: std::cerr << "In function updateCell - Type " << cellTypeToString(grid[y][x].type) << " not included!\n"; break;
@@ -1030,8 +1029,9 @@ sf::Color Simulation::getColor(CellType type) {
     case CellType::SMOKE: return sf::Color(50, 45, 45, 255);
     case CellType::ELECTRICITY: return sf::Color(0, 230, 250, 255);
     case CellType::GLASS: return sf::Color(185, 225, 230, 255);
-	case CellType::LAVA: return sf::Color(255, 100, 0, 255);
-	case CellType::COLD: return sf::Color(207, 207, 247, 150); // Cold cells
+    case CellType::LAVA: return sf::Color(255, 100, 0, 255);
+    case CellType::COLD: return sf::Color(207, 207, 247, 150); // Cold cells
+	    
     default: std::cerr << "getColor: Type not included!\n"; return sf::Color::Magenta;
     }
 }
