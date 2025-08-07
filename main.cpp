@@ -11,8 +11,9 @@ constexpr int FRAME_RATE = 0; // Max frame rate in FPS
 constexpr int TICK_RATE = 60; // Max simulation update rate in Hz
 constexpr double TICK_TIME = 1.0 / TICK_RATE; // seconds per tick
 
-constexpr int TEMP_MAX = 3000; // Maximum temperature for particles
-constexpr int TEMP_MIN = -273; // Absolute zero, minimum temperature for particles
+// Temperature constants
+constexpr int16_t TEMP_MAX = 4095; // Maximum temperature that the cell struct can hold
+constexpr int16_t TEMP_MIN = -4096; // Minimum temp., technically should be -273 but let's just use all of the bits
 
 
 // global frame counter for simulation updates
@@ -66,28 +67,39 @@ union CellData {
  struct Cell {
     // 1 byte: 4-bit type + 4-bit general flags
     uint8_t typeAndFlags = 0; // lower 4 bits: type, upper 4 bits: flags
-
     // 1 byte: general-purpose update marker
     uint8_t lastUpdate = 0;
-
-    // 13 bits: temperature (-4095 to 4095) 
-    int16_t temperature : 13;
-    uint16_t category : 3; // 3 bits for category (max 8 categories)
-
-
+    uint16_t tempAndCategory = 0; // 13 bits temperature, 3 bits category
     // 1 byte: low precision thermal conductivity (0 to 255)
     uint8_t thermalConductivity = 0;
-
-    // 1 byte: optional (e.g., a local ID or additional global flag byte)
-    // uint8_t extraField = 0;
-
     // 4 bytes: union
     CellData data;
 
+	// functions to access and modify the cell's type, flags, temperature, and category
     inline uint8_t getType() const { return typeAndFlags & 0x0F; }
     inline void setType(uint8_t t) { typeAndFlags = (typeAndFlags & 0xF0) | (t & 0x0F); }
     inline uint8_t getFlags() const { return (typeAndFlags >> 4) & 0x0F; }
     inline void setFlags(uint8_t f) { typeAndFlags = (typeAndFlags & 0x0F) | ((f & 0x0F) << 4); }
+
+    // Temperature accessors (signed 13 bits: -4096 to 4095)
+    inline int16_t& getTemperature() const {
+        int16_t raw = tempAndCategory & 0x1FFF;
+        // Sign-extend 13 bits to 16 bits
+        if (raw & 0x1000) raw |= 0xE000;
+        return raw;
+    }
+    inline void setTemperature(int16_t temp) {
+        uint16_t t = static_cast<uint16_t>(temp) & 0x1FFF;
+        tempAndCategory = (tempAndCategory & 0xE000) | t;
+    }
+
+    // Category accessors (3 bits: 0–7)
+    inline uint8_t getCategory() const {
+        return (tempAndCategory >> CURRENT_TYPE_AMOUNT) & 0x07;
+    }
+    inline void setCategory(uint8_t cat) {
+        tempAndCategory = (tempAndCategory & 0x1FFF) | ((cat & 0x07) << 13);
+    }
 };
 
 struct CellProperties {
@@ -146,7 +158,7 @@ private:
 
     CellType currentBrush = CellType::SAND; // Default brush type
     int brushSize = 1; // Default brush size
-
+	float noiseStrength = 0.10f; // Default noise strength for colors
 
 
     // Particle logic
@@ -177,7 +189,7 @@ private:
     inline std::vector<std::array<int, 2>> getCirclePoints(int cx, int cy, int radius);
     inline Cell& read(int x, int y);
     inline void write(int x, int y, const Cell& cell);
-    void clearCells(int x, int y, float temp);
+    void clearCells(int x, int y, int16_t temp);
 
 
     // Particle behavior
@@ -188,6 +200,7 @@ private:
 
     // Misc.
     sf::Color getColor(CellType type);
+    sf::Color addNoiseToColor(sf::Color baseColor, float strength, uint32_t seed);
     sf::Color lerpColor(sf::Color a, sf::Color b, float t);
     std::string cellTypeToString(CellType type);
 
@@ -266,20 +279,20 @@ static inline uint8_t toRawType(CellType t) {
 }
 
 static inline bool getCanFall(const Cell& cell) {
-    return cell.category == 0 ? cell.data.solid.canFall : false;
+    return cell.getCategory() == 0 ? cell.data.solid.canFall : false;
 }
 
 static inline int getDensity(const Cell& cell) {
-    return cell.category == 1 ? (cell.data.liquid.density / 4.0f) : 0.0f;
+    return cell.getCategory() == 1 ? (cell.data.liquid.density / 4) : 0;
     // You can change the divisor based on how you encode density (scaling from 0–15)
 }
 
 static inline bool isParentCell(const Cell& cell) {
-    return cell.category == 3 ? cell.data.other.parentCell : false;
+    return cell.getCategory() == 3 ? cell.data.other.parentCell : false;
 }
 
 static inline uint8_t getLifetime(const Cell& cell) {
-    switch (cell.category) {
+    switch (cell.getCategory()) {
     case 2: return cell.data.gas.lifetime;
     case 3: return cell.data.other.lifetime;
     default: return 0;
@@ -311,13 +324,13 @@ inline void Simulation::write(int x, int y, const Cell& cell) {
     (*nextGrid)[y][x] = cell;
 }
 
-void Simulation::clearCells(int x, int y, float temp = 0.f) {
+void Simulation::clearCells(int x, int y, int16_t temp = 0) {
     // Clear the cell at (x, y) in both grids
     (*currentGrid)[y][x] = createCell(CellType::EMPTY, 0, 0, 0);
     (*nextGrid)[y][x] = (*currentGrid)[y][x];
     // Retain temperature
-    (*currentGrid)[y][x].temperature = temp;
-    (*nextGrid)[y][x].temperature = temp;
+    (*currentGrid)[y][x].setTemperature(temp);
+    (*nextGrid)[y][x].setTemperature(temp);
 
 }
 
@@ -432,37 +445,44 @@ void Simulation::rise(int x, int y) {
 }
 
 void Simulation::radiateHeat(int x, int y) {
+    int16_t selfTemp = read(x, y).getTemperature();
+    int16_t netDelta = 0;
 
-	if (debugMode) dirtyCells.emplace_back(x, y); // Mark the cell as dirty for redrawing in debug mode
-
-
-    float selfTemp = read(x, y).temperature;
-    float netDelta = 0.0f;
-
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
             if (dx == 0 && dy == 0) continue;
 
             int nx = x + dx;
             int ny = y + dy;
             if (!inBounds(nx, ny)) continue;
 
-            float neighborTemp = read(nx, ny).temperature;
+            int16_t neighborTemp = read(nx, ny).getTemperature();
+            int16_t diff = selfTemp - neighborTemp;
 
-            float diff = (selfTemp - neighborTemp) * 0.01f;
-            if (std::abs(diff) < 0.001f) continue;
+            // Integer-based diffusion rate (tweak divisor for speed/precision)
+            int16_t transfer = diff / 16;
 
-            netDelta -= diff;
-            (*nextGrid)[ny][nx].temperature += diff;
-            (*nextGrid)[ny][nx].temperature = std::clamp((*nextGrid)[ny][nx].temperature, static_cast<int16_t>(TEMP_MIN), static_cast<int16_t>(TEMP_MAX));
+            // Allow very small transfers (1 unit) to build up over time
+            if (transfer == 0 && diff != 0)
+                transfer = (diff > 0) ? 1 : -1;
+
+            netDelta -= transfer;
+
+            // Write back neighbor (divide to return to base temp units)
+            int16_t updatedNeighbor = (*nextGrid)[ny][nx].getTemperature();
+            updatedNeighbor += static_cast<int16_t>(transfer);
+            updatedNeighbor = std::clamp(updatedNeighbor, TEMP_MIN, TEMP_MAX);
+            (*nextGrid)[ny][nx].setTemperature(updatedNeighbor);
         }
     }
 
-    Cell newCell = read(x, y);
-    newCell.temperature += netDelta;
-    newCell.temperature = std::clamp(newCell.temperature, static_cast<int16_t>(TEMP_MIN), static_cast<int16_t>(TEMP_MAX));
-    (*nextGrid)[y][x] = newCell;
+    // Update self temperature
+    int16_t updatedSelf = read(x, y).getTemperature();
+    updatedSelf += static_cast<int16_t>(netDelta);
+    updatedSelf = std::clamp(updatedSelf, TEMP_MIN, TEMP_MAX);
+    (*nextGrid)[y][x].setTemperature(updatedSelf);
 }
+
 
 Category Simulation::getCategoryFromType(CellType type) {
     switch (type) {
@@ -508,8 +528,8 @@ Cell Simulation::createCell(CellType type, int16_t temperature, int8_t density, 
     c.setType(static_cast<uint8_t>(type));
 	c.setFlags(0b0000); // reset flags to 0
 	c.lastUpdate = 0; // Reset last update counter
-    c.temperature = temperature;
-	c.category = static_cast<uint8_t>(getCategoryFromType(type));
+    c.setTemperature(temperature);
+	c.setCategory(static_cast<uint8_t>(getCategoryFromType(type)));
 	c.thermalConductivity = cellProperties[PropertyIndexMap[type]].thermalConductivity; // Set thermal conductivity based on the property array
 	// All of the properties are set, now we can add the data union
 
@@ -632,6 +652,10 @@ void Simulation::handleInput(const sf::RenderWindow& window) {
 			debugModeIndex = 3; // Set mode index for lifetime view
 		}
 
+		if (pressOnce(sf::Keyboard::Num8)) {
+			std::cout << "Debug: No dirty cells\n";
+			debugModeIndex = 8; // Set mode to draw all cells — including dirty ones
+		}
         if (pressOnce(sf::Keyboard::Num9)) {
 
             debugText = !debugText; // Toggle debug text display
@@ -699,29 +723,57 @@ void Simulation::handleInput(const sf::RenderWindow& window) {
 		PauseSim = !PauseSim;
 		std::cerr << "Simulation " << (PauseSim ? "paused" : "resumed") << '\n';
 	}
-    
+    if (pressOnce(sf::Keyboard::Up)) {
+		// Increase noise strength
+		noiseStrength += 0.01f;
+		std::cerr << "Increased noise strength to " << noiseStrength << '\n';
+    }
+    if (pressOnce(sf::Keyboard::Down)) {
+        // Decrease noise strength
+        noiseStrength -= 0.01f; // Allow negative values for lighter colors
+        std::cerr << "Decreased noise strength to " << noiseStrength << '\n';
+    }
 
 
 
 }
 
 void Simulation::UpdateWithChecker(bool odd) {
-
-    for(int y = 0; y < HEIGHT; ++y) {
+        auto start = std::chrono::high_resolution_clock::now();
+    for (int y = HEIGHT - 1; y >= 0; --y) {
         for (int x = 0; x < WIDTH; ++x) {
             // Checker pattern for movement bias
-            bool oddCell = (x + y) % 2;
-            if (oddCell != odd)
-                continue;
-            auto start = std::chrono::high_resolution_clock::now();
-            radiateHeat(x, y);
-            auto end = std::chrono::high_resolution_clock::now();
-            //std::cout << "Radiate Heat Frame Time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() << " ns\n";
-
+            // bool oddCell = (x + y) % 2;
+            // if (oddCell != odd) continue;
+            
+            //radiateHeat(x, y);
+            
             updateCell(x, y);
+		
 
+            int16_t& tempA = read(x, y).getTemperature();
+
+            // Exchange with right neighbor
+            if (x + 1 < WIDTH) {
+                int16_t& tempB = read(x + 1, y).getTemperature();
+                int32_t diff = tempA - tempB;
+                int16_t delta = diff / 16; // Tune this
+                tempA -= delta;
+                tempB += delta;
+            }
+
+            // Exchange with bottom neighbor
+            if (y + 1 < HEIGHT) {
+                int16_t& tempC = read(x, y + 1).getTemperature();
+                int32_t diff = tempA - tempC;
+                int16_t delta = diff / 8; // Tune this
+                tempA -= delta;
+                tempC += delta;
+            }
         }
     }
+        auto end = std::chrono::high_resolution_clock::now();
+        std::cout << "Update Loop Frame Time: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " ms\n";
 
 }
 
@@ -757,7 +809,7 @@ void Simulation::updateCell(int x, int y) {
         const Cell& c = grid[y][x];
         std::cerr << "updateCell - Unknown type (int): " << static_cast<int>(c.getType())
             << ", string: " << cellTypeToString(getCellType(c))
-            << ", category: " << static_cast<int>(c.category) << "\n";
+            << ", category: " << static_cast<int>(c.getCategory()) << "\n";
     }
 }
 
@@ -782,7 +834,7 @@ void Simulation::updateSand(int x, int y) {
     }
 
     
-    if (cell.temperature >= 1700) (*nextGrid)[y][x].setType(toRawType(CellType::GLASS));
+    if (cell.getTemperature() >= 1700) (*nextGrid)[y][x].setType(toRawType(CellType::GLASS));
 
     fall(x, y);
 }
@@ -798,7 +850,7 @@ void Simulation::updateWater(int x, int y) {
         return; // Update less if the cell has not been updated recently
     }
 
-    if (cell.temperature >= 100) {
+    if (cell.getTemperature() >= 100) {
         // Convert water to steam if it reaches boiling point
         (*nextGrid)[y][x].setType(toRawType(CellType::STEAM));
     }
@@ -815,7 +867,7 @@ void Simulation::updateFire(int x, int y) {
 
     int maxLife = cell.data.other.parentCell ? 90 : 40;
     if (cell.data.other.lifetime >= maxLife + (rand() % 5)) {
-        clearCells(x, y, cell.temperature); // Clear the cell if it has lived too long
+        clearCells(x, y, cell.getTemperature()); // Clear the cell if it has lived too long
         return;
     }
 
@@ -884,7 +936,7 @@ void Simulation::updateSteam(int x, int y) {
     Cell& cell = read(x, y);
 
 
-    if (cell.temperature <= 100) (*nextGrid)[y][x].setType(toRawType(CellType::WATER)); // Convert steam back to water if it cools down
+    if (cell.getTemperature() <= 100) (*nextGrid)[y][x].setType(toRawType(CellType::WATER)); // Convert steam back to water if it cools down
 
     rise(x, y); // Steam rises by default
 }
@@ -908,7 +960,7 @@ void Simulation::updateElectricity(int x, int y) {
 
 	cell.data.other.lifetime++; // Increment lifetime
     if (cell.data.other.lifetime >= 8) {
-        clearCells(x, y, cell.temperature);
+        clearCells(x, y, cell.getTemperature());
         return;
     }
 
@@ -932,7 +984,7 @@ void Simulation::updateElectricity(int x, int y) {
 
     if (neighborCount < 1 || neighborCount > 5) {
         if (rand() % 2 == 0) {
-            clearCells(x, y, cell.temperature);
+            clearCells(x, y, cell.getTemperature());
             return;
         }
     }
@@ -956,7 +1008,7 @@ void Simulation::updateElectricity(int x, int y) {
         int nx = x + finalDx;
         int ny = y + finalDy;
         if (inBounds(nx, ny) && read(nx, ny).getType() == toRawType(CellType::EMPTY)) {
-            write(nx, ny, createCell(CellType::ELECTRICITY, cell.temperature, 0.0f, false));
+            write(nx, ny, createCell(CellType::ELECTRICITY, cell.getTemperature(), 0.0f, false));
             (*nextGrid)[ny][nx].data.other.lifetime = cell.data.other.lifetime + 1;
         }
     }
@@ -978,7 +1030,7 @@ void Simulation::updateStone(int x, int y) {
 
     Cell& cell = read(x, y);
 
-    if (cell.temperature >= 1205) (*nextGrid)[y][x].setType(toRawType(CellType::LAVA));
+    if (cell.getTemperature() >= 1205) (*nextGrid)[y][x].setType(toRawType(CellType::LAVA));
 
     fall(x, y);
 
@@ -990,7 +1042,7 @@ void Simulation::updateWood(int x, int y) {
 
 
 
-    if (cell.temperature >= 300) {
+    if (cell.getTemperature() >= 300) {
 		// Wood ignites
 		(*nextGrid)[y][x].setType(toRawType(CellType::FIRE));
     }
@@ -1005,7 +1057,7 @@ void Simulation::updateLava(int x, int y) {
 
     Cell& cell = read(x, y);
 
-    if (cell.temperature <= 1195) (*nextGrid)[y][x].setType(toRawType(CellType::STONE));
+    if (cell.getTemperature() <= 1195) (*nextGrid)[y][x].setType(toRawType(CellType::STONE));
 
     flow(x, y);
 
@@ -1015,7 +1067,7 @@ void Simulation::updateCold(int x, int y) {
 
     Cell& cell = read(x, y);
 
-    clearCells(x, y, cell.temperature); // Clear the cell but retain temperature
+    clearCells(x, y, cell.getTemperature()); // Clear the cell but retain temperature
     // Cold cells do not move or interact, just make thing really cold for some time
 
 }
@@ -1023,15 +1075,19 @@ void Simulation::updateCold(int x, int y) {
 sf::Color Simulation::getDebugColor(const Cell& cell) {
 
     if (debugModeIndex == 1) {
-        return getTemperatureColor(cell.temperature);
+        return getTemperatureColor(cell.getTemperature());
     }
 	if (debugModeIndex == 2) {
-        return getLowTemperatureColor(cell.temperature);
+        return getLowTemperatureColor(cell.getTemperature());
 	}
     if (debugModeIndex == 3) {
         return getLifetimeColor(getLifetime(cell));
     }
 
+	if (debugModeIndex == 8) {
+		// Normal debug mode, return color based on cell type
+		return getColor(getCellType(cell));
+	}
     if (debugModeIndex == 0) {
         // Default view, return color based on cell type
         return getColor(getCellType(cell));
@@ -1178,7 +1234,7 @@ void Simulation::drawDebugText(sf::RenderWindow& window) {
     oss << "Position: (" << x << ", " << y << ")\n"
         << "Type: " << cellTypeToString(getCellType(cell)) << "\n"
         << "Density: " << getDensity(cell) << "\n"
-        << "Temperature: " << cell.temperature << "\n"
+        << "Temperature: " << cell.getTemperature() << "\n"
         << "Lifetime: " << getLifetime(cell) << "\n"
         << "Can Fall: " << (getCanFall(cell) ? "Yes" : "No") << "\n"
         << "Last update: " << cell.lastUpdate << "\n"
@@ -1198,28 +1254,59 @@ void Simulation::drawDebugText(sf::RenderWindow& window) {
 	window.draw(text);
 }
 
+sf::Color Simulation::addNoiseToColor(sf::Color baseColor, float strength, uint32_t seed) {
+    // Simple hash function
+    uint32_t h = seed;
+    h ^= h >> 17;
+    h *= 0xed5ad4bb;
+    h ^= h >> 11;
+    h *= 0xac4c1b51;
+    h ^= h >> 15;
+    h *= 0x31848bab;
+    h ^= h >> 14;
+
+    // Generate darkening factor: [1 - strength, 1.0]
+    float factor = 1.0f - ((h & 0xFF) / 255.0f) * strength;
+
+    // Darken RGB channels
+    sf::Uint8 r = static_cast<sf::Uint8>(baseColor.r * factor);
+    sf::Uint8 g = static_cast<sf::Uint8>(baseColor.g * factor);
+    sf::Uint8 b = static_cast<sf::Uint8>(baseColor.b * factor);
+
+    return sf::Color(r, g, b, baseColor.a); // Preserve alpha
+}
+
 void Simulation::draw(sf::RenderWindow& window) {
-    if (dirtyCells.capacity() > 100000) {
+    
+    if (debugModeIndex != 0) {
+        // In debug mode: redraw everything, ignore dirtyCells
+        for (int y = 0; y < HEIGHT; ++y) {
+            for (int x = 0; x < WIDTH; ++x) {
+                const Cell& cell = read(x, y);
+                sf::Color color = addNoiseToColor(getDebugColor(cell), noiseStrength, x + y * WIDTH);
+                framebuffer.setPixel(x, y, color);
+            }
+        }
+    }
+    else {
+
+		// Normal mode: only draw dirty cells
+        if (dirtyCells.capacity() > 100000) {
         std::cout << "Spiked dirty cell capacity: " << dirtyCells.capacity() << "\n";
-    }
-
-    for (const auto& pos : dirtyCells) {
-        int x = pos.x;
-        int y = pos.y;
-        const Cell& cell = read(x, y);
-
-        sf::Color color;
-        if (debugModeIndex != 0) {
-            color = getDebugColor(cell);
-        }
-        else {
-            color = getColor(getCellType(cell));
         }
 
-        framebuffer.setPixel(x, y, color);
+        // Normal mode: only draw dirty cells
+        for (const auto& pos : dirtyCells) {
+            int x = pos.x;
+            int y = pos.y;
+            const Cell& cell = read(x, y);
+
+            sf::Color color = addNoiseToColor(getColor(getCellType(cell)), noiseStrength, x + y * WIDTH);
+            framebuffer.setPixel(x, y, color);
+        }
     }
 
-    // Upload entire image to GPU — this is still fast
+    // Upload framebuffer to GPU
     framebufferTexture.update(framebuffer);
 
     // Draw the sprite
@@ -1230,7 +1317,6 @@ void Simulation::draw(sf::RenderWindow& window) {
         drawDebugText(window);
     }
 
-    // Clear dirty list
     dirtyCells.clear();
 }
 
@@ -1321,7 +1407,7 @@ int main() {
 
             std::cout << "FPS: " << fps << '\n';
 
-            if (logFPS) {
+            if (logFPS) {   
                 File << fps << ", ";
             }
 
