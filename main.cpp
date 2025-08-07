@@ -8,7 +8,7 @@ constexpr int HEIGHT = 150;
 constexpr int PIXEL_SIZE = 4; // Screen pixel size per cell
 
 constexpr int FRAME_RATE = 0; // Max frame rate in FPS
-constexpr int TICK_RATE = 30; // Max simulation update rate in Hz
+constexpr int TICK_RATE = 60; // Max simulation update rate in Hz
 constexpr double TICK_TIME = 1.0 / TICK_RATE; // seconds per tick
 
 constexpr int TEMP_MAX = 3000; // Maximum temperature for particles
@@ -37,7 +37,6 @@ enum class InputMode {
     // Add more as needed
 };
 
-#pragma pack(push, 1) // force tight layout
 struct SolidData {
     uint8_t canFall : 1;
     uint8_t reserved : 7; // room for more flags later
@@ -64,17 +63,16 @@ union CellData {
     OtherData other;
 };
 
-struct Cell {
+ struct Cell {
     // 1 byte: 4-bit type + 4-bit general flags
-    uint8_t type : 4;
-    uint8_t flags : 4;
+    uint8_t typeAndFlags = 0; // lower 4 bits: type, upper 4 bits: flags
 
     // 1 byte: general-purpose update marker
     uint8_t lastUpdate = 0;
 
     // 13 bits: temperature (-4095 to 4095) 
     int16_t temperature : 13;
-    int16_t category : 3; // 3 bits for category (max 8 categories)
+    uint16_t category : 3; // 3 bits for category (max 8 categories)
 
 
     // 1 byte: low precision thermal conductivity (0 to 255)
@@ -85,8 +83,12 @@ struct Cell {
 
     // 4 bytes: union
     CellData data;
+
+    inline uint8_t getType() const { return typeAndFlags & 0x0F; }
+    inline void setType(uint8_t t) { typeAndFlags = (typeAndFlags & 0xF0) | (t & 0x0F); }
+    inline uint8_t getFlags() const { return (typeAndFlags >> 4) & 0x0F; }
+    inline void setFlags(uint8_t f) { typeAndFlags = (typeAndFlags & 0x0F) | ((f & 0x0F) << 4); }
 };
-#pragma pack(pop)
 
 struct CellProperties {
     CellType type;
@@ -111,6 +113,8 @@ public:
     void Simulation::drawDebugText(sf::RenderWindow& window);
 
 
+    std::vector<sf::Vector2i> dirtyCells; // Stores all of the cells' position that need to be redrawn
+
     bool PauseSim = false; // Pause simulation flag
     bool debugMode = false; // Debug mode flag (for temperature, lifetime, etc.)
 
@@ -118,6 +122,9 @@ public:
     int debugModeIndex = 0; // Index for current mode (for hotkeys, etc.)
 	bool debugText = false; // Show debug text flag
 
+    sf::Image framebuffer;
+    sf::Texture framebufferTexture;
+    sf::Sprite framebufferSprite;
 
 private:
 
@@ -143,7 +150,7 @@ private:
 
 
     // Particle logic
-    void UpdateWithChecker(int mode, bool odd);
+    void UpdateWithChecker(bool odd);
     void updateCell(int x, int y);
       void updateSand(int x, int y);
       void updateWater(int x, int y);
@@ -164,12 +171,12 @@ private:
     void swapCells(int x1, int y1, int x2, int y2);
     // bool canMoveTo(int x, int y, const Cell& from);
     Category getCategoryFromType(CellType type);
-    CellType getCellType(const Cell& c);
+    inline CellType getCellType(const Cell& c);
     Cell createCell(CellType type, int16_t temperature, int8_t density, bool canFall);
 
-    std::vector<std::array<int, 2>> getCirclePoints(int cx, int cy, int radius);
-    Cell& read(int x, int y);
-    void write(int x, int y, const Cell& cell);
+    inline std::vector<std::array<int, 2>> getCirclePoints(int cx, int cy, int radius);
+    inline Cell& read(int x, int y);
+    inline void write(int x, int y, const Cell& cell);
     void clearCells(int x, int y, float temp);
 
 
@@ -233,8 +240,15 @@ Simulation::Simulation() {
     for (int y = 0; y < HEIGHT; y++) {
         for (int x = 0; x < WIDTH; x++) {
             write(x, y, createCell(CellType::EMPTY, 0, 0, false));
+			dirtyCells.emplace_back(x, y); // Mark all cells as dirty for initial drawing
         }
     }
+
+	// Initialize framebuffer and texture
+    framebuffer.create(WIDTH, HEIGHT, sf::Color::Black);
+    framebufferTexture.create(WIDTH, HEIGHT);
+    framebufferSprite.setTexture(framebufferTexture);
+    framebufferSprite.setScale(PIXEL_SIZE, PIXEL_SIZE); // Makes 1 cell = 1 pixel onscreen
 
 }
 
@@ -242,34 +256,29 @@ bool Simulation::inBounds(int x, int y) {
     return x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT;
 }
 
-CellType Simulation::getCellType(const Cell& c) {
-    if (c.type > CURRENT_TYPE_AMOUNT) {
-        std::cerr << "Invalid cell type: " << static_cast<int>(c.type) << "\n";
-        assert(false && "Invalid cell type");
-    }
-    return static_cast<CellType>(c.type);
+inline CellType Simulation::getCellType(const Cell& c) {
+    assert(static_cast<uint8_t>(c.getType()) < CURRENT_TYPE_AMOUNT && "Invalid cell type");
+    return static_cast<CellType>(c.getType());
 }
 
-
-
-inline uint8_t toRawType(CellType t) {
+static inline uint8_t toRawType(CellType t) {
     return static_cast<uint8_t>(t);
 }
 
-inline bool getCanFall(const Cell& cell) {
+static inline bool getCanFall(const Cell& cell) {
     return cell.category == 0 ? cell.data.solid.canFall : false;
 }
 
-inline int getDensity(const Cell& cell) {
+static inline int getDensity(const Cell& cell) {
     return cell.category == 1 ? (cell.data.liquid.density / 4.0f) : 0.0f;
     // You can change the divisor based on how you encode density (scaling from 0–15)
 }
 
-inline bool isParentCell(const Cell& cell) {
+static inline bool isParentCell(const Cell& cell) {
     return cell.category == 3 ? cell.data.other.parentCell : false;
 }
 
-inline uint8_t getLifetime(const Cell& cell) {
+static inline uint8_t getLifetime(const Cell& cell) {
     switch (cell.category) {
     case 2: return cell.data.gas.lifetime;
     case 3: return cell.data.other.lifetime;
@@ -287,13 +296,17 @@ void Simulation::swapCells(int x1, int y1, int x2, int y2) {
     // Reset last update counter for the swapped cells
     (*nextGrid)[y1][x1].lastUpdate = 0;
     (*nextGrid)[y2][x2].lastUpdate = 0;
+
+	// Mark the cells as dirty for redrawing
+    dirtyCells.emplace_back(x1, y1);
+    dirtyCells.emplace_back(x2, y2);
 }
 
-Cell& Simulation::read(int x, int y) {
+inline Cell& Simulation::read(int x, int y) {
     return (*currentGrid)[y][x];
 }
 
-void Simulation::write(int x, int y, const Cell& cell) {
+inline void Simulation::write(int x, int y, const Cell& cell) {
     // Write the cell to the next grid
     (*nextGrid)[y][x] = cell;
 }
@@ -346,7 +359,7 @@ void Simulation::flow(int x, int y) {
     // Try falling straight down
     if (inBounds(x, y + 1)) {
         Cell& below = read(x, y + 1);
-        if (below.data.liquid.density < cell.data.liquid.density || below.type == toRawType(CellType::EMPTY)) {
+        if (below.data.liquid.density < cell.data.liquid.density || below.getType() == toRawType(CellType::EMPTY)) {
             swapCells(x, y, x, y + 1);
             return;
         }
@@ -419,6 +432,10 @@ void Simulation::rise(int x, int y) {
 }
 
 void Simulation::radiateHeat(int x, int y) {
+
+	if (debugMode) dirtyCells.emplace_back(x, y); // Mark the cell as dirty for redrawing in debug mode
+
+
     float selfTemp = read(x, y).temperature;
     float netDelta = 0.0f;
 
@@ -488,8 +505,8 @@ Cell Simulation::createCell(CellType type, int16_t temperature, int8_t density, 
     Cell c = {};
 
 	// Add the properties to the cell
-	c.type = toRawType(type);
-	c.flags = 0b0000; // Reset flags
+    c.setType(static_cast<uint8_t>(type));
+	c.setFlags(0b0000); // reset flags to 0
 	c.lastUpdate = 0; // Reset last update counter
     c.temperature = temperature;
 	c.category = static_cast<uint8_t>(getCategoryFromType(type));
@@ -518,7 +535,7 @@ Cell Simulation::createCell(CellType type, int16_t temperature, int8_t density, 
 	return c;
 }
 
-std::vector<std::array<int, 2>> Simulation::getCirclePoints(int cx, int cy, int radius) {
+inline std::vector<std::array<int, 2>> Simulation::getCirclePoints(int cx, int cy, int radius) {
     std::vector<std::array<int, 2>> result;
     int rSquared = radius * radius;
 
@@ -570,7 +587,7 @@ void Simulation::handleInput(const sf::RenderWindow& window) {
                 const CellProperties& base = cellProperties[PropertyIndexMap[currentBrush]];
 
                 write( affec[0], affec[1],
-                    createCell( currentBrush, base.density, base.temperature, base.canFall ));
+                    createCell( currentBrush, base.temperature, base.density, base.canFall ));
 
                 (*currentGrid)[affec[1]][affec[0]] = (*nextGrid)[affec[1]][affec[0]]; // Copy to next grid
             }
@@ -688,77 +705,32 @@ void Simulation::handleInput(const sf::RenderWindow& window) {
 
 }
 
-void Simulation::UpdateWithChecker(int mode, bool odd) {
+void Simulation::UpdateWithChecker(bool odd) {
 
-    int xStart, xEnd, xStep = 0;
-    int yStart, yEnd, yStep = 0;
+    for(int y = 0; y < HEIGHT; ++y) {
+        for (int x = 0; x < WIDTH; ++x) {
+            // Checker pattern for movement bias
+            bool oddCell = (x + y) % 2;
+            if (oddCell != odd)
+                continue;
+            auto start = std::chrono::high_resolution_clock::now();
+            radiateHeat(x, y);
+            auto end = std::chrono::high_resolution_clock::now();
+            //std::cout << "Radiate Heat Frame Time: " << std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() << " ns\n";
 
-    switch (mode) {
-    case 0: // Top to Bottom, Left to Right
-        yStart = 0;        yEnd = HEIGHT; yStep = 1;
-        xStart = 0;        xEnd = WIDTH;  xStep = 1;
-        break;
-    case 1: // Top to Bottom, Right to Left
-        yStart = 0;        yEnd = HEIGHT; yStep = 1;
-        xStart = WIDTH - 1;  xEnd = -1;     xStep = -1;
-        break;
-    case 2: // Bottom to Top, Left to Right
-        yStart = HEIGHT - 1; yEnd = -1;     yStep = -1;
-        xStart = 0;        xEnd = WIDTH;  xStep = 1;
-        break;
-    case 3: // Bottom to Top, Right to Left
-        yStart = HEIGHT - 1; yEnd = -1;     yStep = -1;
-        xStart = WIDTH - 1;  xEnd = -1;     xStep = -1;
-        break;
-    default:
-        assert(false && "function UpdateWithChecker mode invalid!"); // Invalid mode
-    }
+            updateCell(x, y);
 
-    for (int y = yStart; y != yEnd; y += yStep) {
-        for (int x = xStart; x != xEnd; x += xStep) {
-            if ((x % 2 == 1) == odd) {
-                radiateHeat(x, y);
-                updateCell(x, y);
-            }
         }
     }
-
 
 }
 
 void Simulation::update() {
 
-    // Update the grid with a checker pattern and alternating frame updating direction
-    if (alternatingFrames == 0) {
-        // Update with checker pattern
-        UpdateWithChecker(0, 0);
-        UpdateWithChecker(1, 1);
+	UpdateWithChecker(frameCounter % 2 == 0); // Use checkerboard pattern for updates
+	UpdateWithChecker(frameCounter % 2 == 1); // Use checkerboard pattern for updates
 
-        alternatingFrames++; // Increment for next frame
-    }
-    else if (alternatingFrames == 1) {
-        // Update without checker pattern
-        UpdateWithChecker(1, 1);
-        UpdateWithChecker(2, 0);
-
-        alternatingFrames++; // Increment for next frame
-    }
-    else if (alternatingFrames == 2) {
-        // Update without checker pattern
-        UpdateWithChecker(2, 0);
-        UpdateWithChecker(3, 1);
-
-        alternatingFrames++; // Increment for next frame
-    }
-    else if (alternatingFrames == 3) {
-        // Update without checker pattern
-        UpdateWithChecker(3, 1);
-        UpdateWithChecker(0, 0);
-
-        alternatingFrames = 0; // Reset for next frame
-    }
-
-    std::swap(currentGrid, nextGrid); // Swap the grids to apply updates
+    std::swap(currentGrid, nextGrid);
 
 
 
@@ -781,8 +753,9 @@ void Simulation::updateCell(int x, int y) {
     case CellType::COLD: updateCold(x, y); break;
 
     default:
+        std::cerr << static_cast<int>(CellType::COLD) << "\n";
         const Cell& c = grid[y][x];
-        std::cerr << "updateCell - Unknown type (int): " << static_cast<int>(c.type)
+        std::cerr << "updateCell - Unknown type (int): " << static_cast<int>(c.getType())
             << ", string: " << cellTypeToString(getCellType(c))
             << ", category: " << static_cast<int>(c.category) << "\n";
     }
@@ -793,15 +766,15 @@ void Simulation::updateSand(int x, int y) {
     Cell& cell = read(x, y);
 
     
-    if (cell.lastUpdate >= 300) {
+    if (cell.lastUpdate == 255) {
         if (frameCounter % 90 != 0) {
             cell.lastUpdate++;
             (*nextGrid)[y][x] = cell; // Write the current cell to the next grid
             return;
-        }
+        } 
     }
-    else if (cell.lastUpdate >= 60) {
-        if (frameCounter % 30 != 0) {
+    else if (cell.lastUpdate >= 64) {
+        if (frameCounter % 32 != 0) {
             cell.lastUpdate++;
 			(*nextGrid)[y][x] = cell; // Write the current cell to the next grid
             return;
@@ -809,7 +782,7 @@ void Simulation::updateSand(int x, int y) {
     }
 
     
-    if (cell.temperature >= 1700) (*nextGrid)[y][x].type = toRawType(CellType::GLASS);
+    if (cell.temperature >= 1700) (*nextGrid)[y][x].setType(toRawType(CellType::GLASS));
 
     fall(x, y);
 }
@@ -827,7 +800,7 @@ void Simulation::updateWater(int x, int y) {
 
     if (cell.temperature >= 100) {
         // Convert water to steam if it reaches boiling point
-        (*nextGrid)[y][x].type = toRawType(CellType::STEAM);
+        (*nextGrid)[y][x].setType(toRawType(CellType::STEAM));
     }
 
 
@@ -867,7 +840,7 @@ void Simulation::updateFire(int x, int y) {
 
                 int nx = x + dx;
                 int ny = y + dy;
-                if (inBounds(nx, ny) && read(nx, ny).type == toRawType(CellType::FIRE)) fireNeighbors++;
+                if (inBounds(nx, ny) && read(nx, ny).getType() == toRawType(CellType::FIRE)) fireNeighbors++;
             }
         }
 
@@ -881,7 +854,7 @@ void Simulation::updateFire(int x, int y) {
         if (!inBounds(nx, ny)) continue;
         Cell& targetCell = read(nx, ny);
 
-        if (targetCell.type == toRawType(CellType::EMPTY)) {
+        if (targetCell.getType() == toRawType(CellType::EMPTY)) {
             // Slightly vary new cell lifetime to avoid synchronized death
             int newLifetime = cell.data.other.lifetime + 1 + (rand() % 3);
 
@@ -911,7 +884,7 @@ void Simulation::updateSteam(int x, int y) {
     Cell& cell = read(x, y);
 
 
-    if (cell.temperature <= 100) (*nextGrid)[y][x].type = toRawType(CellType::WATER); // Convert steam back to water if it cools down
+    if (cell.temperature <= 100) (*nextGrid)[y][x].setType(toRawType(CellType::WATER)); // Convert steam back to water if it cools down
 
     rise(x, y); // Steam rises by default
 }
@@ -922,7 +895,7 @@ void Simulation::updateSmoke(int x, int y) {
 
 
     if (frameCounter > (600 + rand() % 100)) { // Smoke dissipates after a while
-        (*nextGrid)[y][x].type = toRawType(CellType::EMPTY);
+        (*nextGrid)[y][x].setType(toRawType(CellType::EMPTY));
         return;
     }
 
@@ -949,7 +922,7 @@ void Simulation::updateElectricity(int x, int y) {
             if (dx == 0 && dy == 0) continue;
             int nx = x + dx;
             int ny = y + dy;
-            if (inBounds(nx, ny) && read(nx, ny).type == toRawType(CellType::ELECTRICITY)) {
+            if (inBounds(nx, ny) && read(nx, ny).getType() == toRawType(CellType::ELECTRICITY)) {
                 totalDx += dx;
                 totalDy += dy;
                 neighborCount++;
@@ -982,8 +955,8 @@ void Simulation::updateElectricity(int x, int y) {
     if (finalDx != 0 || finalDy != 0) {
         int nx = x + finalDx;
         int ny = y + finalDy;
-        if (inBounds(nx, ny) && read(nx, ny).type == toRawType(CellType::EMPTY)) {
-            write(nx, ny, createCell(CellType::ELECTRICITY, 0.0f, cell.temperature, false));
+        if (inBounds(nx, ny) && read(nx, ny).getType() == toRawType(CellType::EMPTY)) {
+            write(nx, ny, createCell(CellType::ELECTRICITY, cell.temperature, 0.0f, false));
             (*nextGrid)[ny][nx].data.other.lifetime = cell.data.other.lifetime + 1;
         }
     }
@@ -1005,7 +978,7 @@ void Simulation::updateStone(int x, int y) {
 
     Cell& cell = read(x, y);
 
-    if (cell.temperature >= 1205) (*nextGrid)[y][x].type = toRawType(CellType::LAVA);
+    if (cell.temperature >= 1205) (*nextGrid)[y][x].setType(toRawType(CellType::LAVA));
 
     fall(x, y);
 
@@ -1019,7 +992,7 @@ void Simulation::updateWood(int x, int y) {
 
     if (cell.temperature >= 300) {
 		// Wood ignites
-		(*nextGrid)[y][x].type = toRawType(CellType::FIRE);
+		(*nextGrid)[y][x].setType(toRawType(CellType::FIRE));
     }
 
 
@@ -1032,7 +1005,7 @@ void Simulation::updateLava(int x, int y) {
 
     Cell& cell = read(x, y);
 
-    if (cell.temperature <= 1195) (*nextGrid)[y][x].type = toRawType(CellType::STONE);
+    if (cell.temperature <= 1195) (*nextGrid)[y][x].setType(toRawType(CellType::STONE));
 
     flow(x, y);
 
@@ -1226,42 +1199,39 @@ void Simulation::drawDebugText(sf::RenderWindow& window) {
 }
 
 void Simulation::draw(sf::RenderWindow& window) {
-    sf::VertexArray cells(sf::Quads);
+    if (dirtyCells.capacity() > 100000) {
+        std::cout << "Spiked dirty cell capacity: " << dirtyCells.capacity() << "\n";
+    }
 
-    
+    for (const auto& pos : dirtyCells) {
+        int x = pos.x;
+        int y = pos.y;
+        const Cell& cell = read(x, y);
 
-    for (int y = 0; y < HEIGHT; ++y) {
-        for (int x = 0; x < WIDTH; ++x) {
-            const Cell& cell = read(x, y);
-
-
-            float px = x * PIXEL_SIZE;
-            float py = y * PIXEL_SIZE;
-
-
-            sf::Color color;
-
-            if (debugModeIndex != 0) {
-                color = getDebugColor(cell);
-            }
-            else {
-                color = getColor(static_cast<CellType>(cell.type));
-            }
-
-
-            // Add the cell as a quad
-            cells.append(sf::Vertex(sf::Vector2f(px, py), color));
-            cells.append(sf::Vertex(sf::Vector2f(px + PIXEL_SIZE, py), color));
-            cells.append(sf::Vertex(sf::Vector2f(px + PIXEL_SIZE, py + PIXEL_SIZE), color));
-            cells.append(sf::Vertex(sf::Vector2f(px, py + PIXEL_SIZE), color));
+        sf::Color color;
+        if (debugModeIndex != 0) {
+            color = getDebugColor(cell);
         }
+        else {
+            color = getColor(getCellType(cell));
+        }
+
+        framebuffer.setPixel(x, y, color);
     }
-    
-    window.draw(cells);
-    
+
+    // Upload entire image to GPU — this is still fast
+    framebufferTexture.update(framebuffer);
+
+    // Draw the sprite
+    window.draw(framebufferSprite);
+
+    // Optional: draw debug overlay
     if (debugText) {
-        drawDebugText(window); // Draw debug text if enabled
+        drawDebugText(window);
     }
+
+    // Clear dirty list
+    dirtyCells.clear();
 }
 
 sf::Color Simulation::getColor(CellType type) {
@@ -1288,7 +1258,6 @@ int main() {
 
     srand(time(NULL));
 
-    // Move large objects to the heap  
     auto window = std::make_unique<sf::RenderWindow>(sf::VideoMode(WIDTH * PIXEL_SIZE, HEIGHT * PIXEL_SIZE), "Sandbox");
     window->setFramerateLimit(FRAME_RATE);
 
@@ -1299,76 +1268,71 @@ int main() {
 
     std::ofstream File("log.txt");
 
-	if (!File.is_open()) {
-		std::cerr << "Error opening log file!\n";
-		return 1;
-	}
-	bool logFPS = false; // Enable FPS logging to file
+    if (!File.is_open()) {
+        std::cerr << "Error opening log file!\n";
+        return 1;
+    }
+    bool logFPS = true;
 
-    float lastFPS = TICK_RATE;
+    // FPS measurement variables
+    int frameCounter = 0;
+    auto fpsTimerStart = std::chrono::high_resolution_clock::now();
 
-    // Main loop
     while (window->isOpen()) {
-
         auto current = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = current - previous;
         previous = current;
 
         if (!sim->PauseSim) lag += elapsed.count();
 
-        // Always handle window events
+        // Handle window events
         sf::Event event;
         while (window->pollEvent(event)) {
             if (event.type == sf::Event::Closed)
                 window->close();
         }
 
-
         sim->handleInput(*window);
 
-
-        // Only update simulation if not paused
+        // Simulation update loop
         while (lag >= TICK_TIME) {
             if (!sim->PauseSim) {
-                sim->update(); // Updates only when not paused
+                sim->update();
                 lag -= TICK_TIME;
             }
             else {
-                sim->swapGrids(); // Swap grids after each tick
-                break; // Exit the loop if paused
+                sim->swapGrids();
+                break;
             }
         }
 
-
-        // Always render — even when paused
         window->clear();
         sim->draw(*window);
         window->display();
 
-       
-
-		// get the current time after rendering
-        auto end = std::chrono::high_resolution_clock::now();
-
-        // Calculate and display FPS every 0.5 seconds
-        if (frameCounter % static_cast<int>(lastFPS / 2) == 0) {
-            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - current).count();
-            lastFPS = 1000000.f / duration;
-            std::cout << "FPS: " << static_cast<int>(lastFPS) << '\n';
-            frameCounter = 0; // Reset frame counter
-
-
-			// Log FPS to file if enabled
-            if (logFPS) {
-				File << "FPS: " << lastFPS << '\n'; // Log FPS to file
-            }
-        }
-
+        // FPS counting
         frameCounter++;
-    }
 
+        auto now = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> fpsElapsed = now - fpsTimerStart;
+
+        if (fpsElapsed.count() >= 0.1) {  // Every 1 second
+            double fps = frameCounter / fpsElapsed.count();
+
+            std::cout << "FPS: " << fps << '\n';
+
+            if (logFPS) {
+                File << fps << ", ";
+            }
+
+            // Reset counters for next interval
+            frameCounter = 0;
+            fpsTimerStart = now;
+        }
+    }
 
     return 0;
 }
+
 
 
